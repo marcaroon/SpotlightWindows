@@ -1,0 +1,300 @@
+<Window x:Class="SpotlightWindows.UI.Views.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d"
+        Title="Spotlight"
+        Height="480" Width="640"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        ResizeMode="NoResize"
+        Topmost="True"
+        ShowInTaskbar="False"
+        Focusable="True"
+        PreviewKeyDown="Window_PreviewKeyDown">
+
+    <Window.Resources>
+        <!-- ═══════════════════════════════════════════════ -->
+        <!-- Color palette (Catppuccin Mocha-inspired dark) -->
+        <!-- ═══════════════════════════════════════════════ -->
+        <Color x:Key="AccentColor">#6366F1</Color>
+        <Color x:Key="AccentLightColor">#818CF8</Color>
+        <Color x:Key="AccentGlowColor">#4F46E5</Color>
+        <Color x:Key="SearchBoxBgColor">#1E1E2E</Color>
+        <Color x:Key="PanelBgColor">#181825</Color>
+        <Color x:Key="TextPrimaryColor">#CDD6F4</Color>
+        <Color x:Key="TextSecondaryColor">#6C7086</Color>
+        <Color x:Key="BorderSubtleColor">#313244</Color>
+        <Color x:Key="SurfaceColor">#1E1E2E</Color>
+        <Color x:Key="HoverColor">#2A2A3C</Color>
+        <Color x:Key="SelectedColor">#33335A</Color>
+
+        <SolidColorBrush x:Key="AccentBrush" Color="{StaticResource AccentColor}"/>
+        <SolidColorBrush x:Key="AccentLightBrush" Color="{StaticResource AccentLightColor}"/>
+        <SolidColorBrush x:Key="SearchBoxBg" Color="{StaticResource SearchBoxBgColor}"/>
+        <SolidColorBrush x:Key="PanelBg" Color="{StaticResource PanelBgColor}"/>
+        <SolidColorBrush x:Key="TextPrimary" Color="{StaticResource TextPrimaryColor}"/>
+        <SolidColorBrush x:Key="TextSecondary" Color="{StaticResource TextSecondaryColor}"/>
+        <SolidColorBrush x:Key="BorderSubtle" Color="{StaticResource BorderSubtleColor}"/>
+        <SolidColorBrush x:Key="SurfaceBrush" Color="{StaticResource SurfaceColor}"/>
+        <SolidColorBrush x:Key="HoverBrush" Color="{StaticResource HoverColor}"/>
+        <SolidColorBrush x:Key="SelectedBrush" Color="{StaticResource SelectedColor}"/>
+
+        <!-- Search box text style (removes default TextBox chrome) -->
+        <Style x:Key="SearchTextBoxStyle" TargetType="TextBox">
+            <Setter Property="FontSize" Value="22"/>
+            <Setter Property="FontFamily" Value="Segoe UI Variable, Segoe UI, sans-serif"/>
+            <Setter Property="FontWeight" Value="Light"/>
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="CaretBrush" Value="{StaticResource AccentLightBrush}"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+            <Setter Property="Padding" Value="0,4"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TextBox">
+                        <ScrollViewer x:Name="PART_ContentHost"
+                                      Focusable="False"
+                                      HorizontalScrollBarVisibility="Hidden"
+                                      VerticalScrollBarVisibility="Hidden"/>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ═══════════════════════════════════════════════ -->
+        <!-- Result item template                            -->
+        <!-- ═══════════════════════════════════════════════ -->
+        <Style x:Key="ResultListBoxItemStyle" TargetType="ListBoxItem">
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ListBoxItem">
+                        <Border x:Name="ItemBorder"
+                                CornerRadius="10"
+                                Padding="12,10"
+                                Margin="2,1"
+                                Background="Transparent"
+                                Cursor="Hand">
+                            <ContentPresenter/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="ItemBorder" Property="Background"
+                                        Value="{StaticResource HoverBrush}"/>
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="ItemBorder" Property="Background"
+                                        Value="{StaticResource SelectedBrush}"/>
+                                <Setter TargetName="ItemBorder" Property="BorderBrush"
+                                        Value="{StaticResource AccentBrush}"/>
+                                <Setter TargetName="ItemBorder" Property="BorderThickness"
+                                        Value="1"/>
+                                <Setter TargetName="ItemBorder" Property="Padding"
+                                        Value="11,9"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Setter Property="Focusable" Value="False"/>
+        </Style>
+    </Window.Resources>
+
+    <!-- Outer margin provides space for the drop shadow to render -->
+    <Border Margin="20">
+        <!-- Outer glow border -->
+        <Border CornerRadius="14"
+                BorderThickness="1"
+                BorderBrush="{StaticResource BorderSubtle}">
+            <Border.Effect>
+                <DropShadowEffect BlurRadius="30"
+                                  ShadowDepth="2"
+                                  Opacity="0.6"
+                                  Color="#000000"/>
+            </Border.Effect>
+
+            <!-- Clip content to rounded corners -->
+            <Border CornerRadius="14" ClipToBounds="True">
+                <Grid Background="{StaticResource PanelBg}">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <!-- ══════════════════════════════ -->
+                    <!-- Row 0: Search input area       -->
+                    <!-- ══════════════════════════════ -->
+                    <Border Grid.Row="0"
+                            Background="{StaticResource SearchBoxBg}"
+                            Padding="20,18,20,18">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+
+                            <!-- Search icon (Segoe Fluent Icons magnifying glass) -->
+                            <Border Grid.Column="0"
+                                    Width="32" Height="32"
+                                    CornerRadius="8"
+                                    Background="{StaticResource AccentBrush}"
+                                    Margin="0,0,14,0"
+                                    VerticalAlignment="Center">
+                                <TextBlock Text="&#xE721;"
+                                           FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets"
+                                           FontSize="15"
+                                           Foreground="White"
+                                           HorizontalAlignment="Center"
+                                           VerticalAlignment="Center"/>
+                            </Border>
+
+                            <!-- Search text box with watermark -->
+                            <Grid Grid.Column="1">
+                                <TextBlock x:Name="WatermarkText"
+                                           Text="Search anything..."
+                                           FontSize="22"
+                                           FontFamily="Segoe UI Variable, Segoe UI, sans-serif"
+                                           FontWeight="Light"
+                                           Foreground="{StaticResource TextSecondary}"
+                                           VerticalAlignment="Center"
+                                           Padding="0,4"
+                                           IsHitTestVisible="False"/>
+
+                                <TextBox x:Name="SearchTextBox"
+                                         Style="{StaticResource SearchTextBoxStyle}"
+                                         TextChanged="SearchTextBox_TextChanged"/>
+                            </Grid>
+
+                            <!-- Keyboard shortcut hint -->
+                            <Border Grid.Column="2"
+                                    Background="{StaticResource SurfaceBrush}"
+                                    CornerRadius="6"
+                                    Padding="8,4"
+                                    VerticalAlignment="Center"
+                                    Margin="10,0,0,0">
+                                <TextBlock Text="Esc"
+                                           FontSize="11"
+                                           FontFamily="Segoe UI, sans-serif"
+                                           Foreground="{StaticResource TextSecondary}"
+                                           VerticalAlignment="Center"/>
+                            </Border>
+                        </Grid>
+                    </Border>
+
+                    <!-- ══════════════════════════════ -->
+                    <!-- Row 1: Separator line           -->
+                    <!-- ══════════════════════════════ -->
+                    <Border Grid.Row="1"
+                            Height="1"
+                            Background="{StaticResource BorderSubtle}"/>
+
+                    <!-- ══════════════════════════════ -->
+                    <!-- Row 2: Results area             -->
+                    <!-- ══════════════════════════════ -->
+                    <Border Grid.Row="2"
+                            Padding="8,6,8,8"
+                            MinHeight="80"
+                            MaxHeight="360">
+                        <Grid>
+                            <!-- Empty state / placeholder -->
+                            <StackPanel x:Name="EmptyStatePanel"
+                                        HorizontalAlignment="Center"
+                                        VerticalAlignment="Center"
+                                        Margin="0,16,0,24">
+                                <TextBlock x:Name="EmptyStateIcon"
+                                           Text="&#xE773;"
+                                           FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets"
+                                           FontSize="28"
+                                           Foreground="{StaticResource TextSecondary}"
+                                           HorizontalAlignment="Center"
+                                           Opacity="0.5"
+                                           Margin="0,0,0,10"/>
+                                <TextBlock x:Name="EmptyStateText"
+                                           Text="Start typing to search..."
+                                           FontSize="14"
+                                           FontFamily="Segoe UI Variable, Segoe UI, sans-serif"
+                                           Foreground="{StaticResource TextSecondary}"
+                                           HorizontalAlignment="Center"/>
+                            </StackPanel>
+
+                            <!-- Results list -->
+                            <ListBox x:Name="ResultsListBox"
+                                     Background="Transparent"
+                                     BorderThickness="0"
+                                     Visibility="Collapsed"
+                                     ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                     ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                     VirtualizingPanel.IsVirtualizing="True"
+                                     ItemContainerStyle="{StaticResource ResultListBoxItemStyle}"
+                                     SelectionChanged="ResultsListBox_SelectionChanged"
+                                     MouseDoubleClick="ResultsListBox_MouseDoubleClick">
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <Grid Margin="0,2">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+
+                                            <!-- App icon -->
+                                            <Border Grid.Column="0"
+                                                    Width="36" Height="36"
+                                                    CornerRadius="8"
+                                                    Background="{StaticResource SurfaceBrush}"
+                                                    Margin="0,0,12,0"
+                                                    VerticalAlignment="Center">
+                                                <!-- Actual icon from ImageSource -->
+                                                <Image Source="{Binding IconSource}"
+                                                       Width="24" Height="24"
+                                                       RenderOptions.BitmapScalingMode="HighQuality"
+                                                       VerticalAlignment="Center"
+                                                       HorizontalAlignment="Center"/>
+                                            </Border>
+
+                                            <!-- Title + subtitle -->
+                                            <StackPanel Grid.Column="1"
+                                                        VerticalAlignment="Center">
+                                                <TextBlock Text="{Binding Title}"
+                                                           FontSize="14"
+                                                           FontFamily="Segoe UI Variable, Segoe UI, sans-serif"
+                                                           FontWeight="Medium"
+                                                           Foreground="{StaticResource TextPrimary}"
+                                                           TextTrimming="CharacterEllipsis"/>
+                                                <TextBlock Text="{Binding Subtitle}"
+                                                           FontSize="11.5"
+                                                           FontFamily="Segoe UI, sans-serif"
+                                                           Foreground="{StaticResource TextSecondary}"
+                                                           Margin="0,2,0,0"
+                                                           TextTrimming="CharacterEllipsis"/>
+                                            </StackPanel>
+
+                                            <!-- Result type badge -->
+                                            <Border Grid.Column="2"
+                                                    Background="{StaticResource SurfaceBrush}"
+                                                    CornerRadius="4"
+                                                    Padding="6,2"
+                                                    VerticalAlignment="Center"
+                                                    Margin="8,0,0,0"
+                                                    Opacity="0.7">
+                                                <TextBlock Text="{Binding ResultType}"
+                                                           FontSize="10"
+                                                           FontFamily="Segoe UI, sans-serif"
+                                                           Foreground="{StaticResource TextSecondary}"/>
+                                            </Border>
+                                        </Grid>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                        </Grid>
+                    </Border>
+                </Grid>
+            </Border>
+        </Border>
+    </Border>
+</Window>
