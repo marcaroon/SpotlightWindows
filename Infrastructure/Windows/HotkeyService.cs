@@ -66,7 +66,7 @@ public sealed class HotkeyService : IDisposable
             return false;
         }
 
-        // Hook into the Win32 message loop to receive WM_HOTKEY
+        // hook into the Win32 message loop to receive WM_HOTKEY
         _hwndSource = HwndSource.FromHwnd(_windowHandle);
         _hwndSource?.AddHook(WndProc);
 

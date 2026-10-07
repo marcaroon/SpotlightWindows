@@ -5,18 +5,21 @@ using SpotlightWindows.Core.Models;
 namespace SpotlightWindows.Core.Services;
 
 /// <summary>
-/// Central search orchestrator that manages multiple search providers,
-/// runs them in parallel with per-provider timeouts, applies configurable
-/// score multipliers, deduplicates results, and returns a unified ranked list.
+/// Central search orchestrator. Replaces the Phase 3 CompositeSearchProvider.
 ///
-/// This replaces the Phase 3 CompositeSearchProvider with:
-///   - Configurable per-provider weight multipliers
-///   - Per-provider timeout enforcement
-///   - Result deduplication by Id
-///   - Search timing diagnostics
-///   - Progressive result merging
+///   - Runs every provider in parallel, always off the caller's thread (Task.Run), so a provider
+///     that does synchronous work can never freeze the UI.
+///   - Enforces a per-provider timeout by *abandoning* a slow provider (it is also asked to cancel),
+///     so cooperative cancellation is not required for the timeout to work.
+///   - Publishes a merged snapshot every time a provider finishes (progressive results).
+///   - Applies a per-provider score multiplier (the "weight") exactly once per result.
+///   - Deduplicates by <see cref="SearchResult.Id"/>; on a clash the higher-scored result wins,
+///     with registration order as the tie-breaker, so the outcome does not depend on arrival order.
+///
+/// Provider contract: SearchAsync must return NEW SearchResult instances on every call,
+/// because the orchestrator multiplies <see cref="SearchResult.Score"/> in place.
 /// </summary>
-public sealed class SearchOrchestrator : ISearchProvider
+public sealed class SearchOrchestrator : IProgressiveSearchProvider
 {
     public string Name => "Orchestrator";
     public bool IsEnabled => true;
@@ -31,165 +34,177 @@ public sealed class SearchOrchestrator : ISearchProvider
     public int DefaultTimeoutMs { get; set; } = 3000;
 
     /// <summary>
-    /// Registers a search provider with a score multiplier and optional timeout.
-    ///
-    /// The multiplier adjusts how that provider's raw scores compare to others:
-    ///   1.0 = no adjustment (default)
-    ///   1.5 = boost scores by 50% (prioritize this provider)
-    ///   0.5 = reduce scores by 50% (deprioritize this provider)
+    /// Registers a provider with a score multiplier and optional timeout.
+    /// 1.0 = unchanged, 0.75 = deprioritize by 25%, 1.5 = boost by 50%.
+    /// Call during startup, before searches begin.
     /// </summary>
     public void RegisterProvider(ISearchProvider provider, double scoreMultiplier = 1.0, int? timeoutMs = null)
     {
         if (!provider.IsEnabled) return;
 
-        _registrations.Add(new ProviderRegistration
-        {
-            Provider = provider,
-            ScoreMultiplier = scoreMultiplier,
-            TimeoutMs = timeoutMs ?? DefaultTimeoutMs
-        });
-
-        _log.Info($"Registered search provider: {provider.Name} (weight: {scoreMultiplier:F1}, timeout: {timeoutMs ?? DefaultTimeoutMs}ms)");
+        var timeout = timeoutMs ?? DefaultTimeoutMs;
+        _registrations.Add(new ProviderRegistration(_registrations.Count, provider, scoreMultiplier, timeout));
+        _log.Info($"Registered search provider: {provider.Name} (weight: {scoreMultiplier:F2}, timeout: {timeout}ms)");
     }
 
-    /// <summary>
-    /// Runs all registered providers in parallel, applies score multipliers,
-    /// deduplicates, and returns a unified ranked list.
-    /// </summary>
+    /// <summary>Non-progressive convenience: waits for all providers and returns the final merged list.</summary>
     public async Task<IReadOnlyList<SearchResult>> SearchAsync(string query, CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(query) || _registrations.Count == 0)
-            return Array.Empty<SearchResult>();
+        IReadOnlyList<SearchResult> final = Array.Empty<SearchResult>();
+        await SearchProgressiveAsync(query, snapshot => final = snapshot.Results, cancellationToken);
+        return final;
+    }
 
-        var overallStopwatch = Stopwatch.StartNew();
+    public async Task SearchProgressiveAsync(string query, Action<SearchSnapshot> onUpdate, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(onUpdate);
 
-        // Launch all providers in parallel with individual timeouts
-        var tasks = _registrations.Select(reg =>
-            SearchWithTimeout(reg, query, cancellationToken));
+        var registrations = _registrations.ToArray();
+        if (string.IsNullOrWhiteSpace(query) || registrations.Length == 0)
+        {
+            Publish(onUpdate, new SearchSnapshot(Array.Empty<SearchResult>(), IsComplete: true));
+            return;
+        }
 
-        var allResultSets = await Task.WhenAll(tasks);
+        var stopwatch = Stopwatch.StartNew();
+        var pending = registrations.Select(r => RunProviderAsync(r, query, cancellationToken)).ToList();
+        var collected = new List<ProviderResult>(registrations.Length);
+        var latest = (IReadOnlyList<SearchResult>)Array.Empty<SearchResult>();
 
-        cancellationToken.ThrowIfCancellationRequested();
+        while (pending.Count > 0)
+        {
+            var finished = await Task.WhenAny(pending); // resumes on caller's context (UI thread)
+            pending.Remove(finished);
 
-        // Merge, deduplicate, sort, and limit
-        var merged = MergeResults(allResultSets);
+            // Never publish for a search that has been superseded
+            cancellationToken.ThrowIfCancellationRequested();
 
-        overallStopwatch.Stop();
-        _log.Info($"Search for \"{query}\" completed: {merged.Count} results in {overallStopwatch.ElapsedMilliseconds}ms");
+            collected.Add(await finished);
+            latest = MergeResults(collected);
+            Publish(onUpdate, new SearchSnapshot(latest, IsComplete: pending.Count == 0));
+        }
 
-        return merged;
+        stopwatch.Stop();
+        _log.Info($"Search \"{query}\" completed: {latest.Count} results in {stopwatch.ElapsedMilliseconds}ms");
     }
 
     /// <summary>
-    /// Runs a single provider with a timeout. If the provider exceeds its
-    /// timeout, the result is discarded (returns empty).
+    /// Runs one provider off-thread with a hard timeout. Never throws: failure, timeout and
+    /// cancellation all yield an empty result set (the caller checks its own token afterwards).
     /// </summary>
-    private async Task<ProviderResult> SearchWithTimeout(
-        ProviderRegistration reg, string query, CancellationToken cancellationToken)
+    private async Task<ProviderResult> RunProviderAsync(ProviderRegistration reg, string query, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
+        var providerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task<IReadOnlyList<SearchResult>>? work = null;
 
         try
         {
-            // Create a linked token that also enforces the per-provider timeout
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeoutCts.CancelAfter(reg.TimeoutMs);
+            var token = providerCts.Token;
 
-            var results = await reg.Provider.SearchAsync(query, timeoutCts.Token);
+            // Task.Run guarantees the provider's synchronous prefix never executes on the caller's thread
+            work = Task.Run(() => reg.Provider.SearchAsync(query, token), CancellationToken.None);
 
+            var raw = await work.WaitAsync(TimeSpan.FromMilliseconds(reg.TimeoutMs), ct).ConfigureAwait(false);
             sw.Stop();
+
+            var results = raw ?? Array.Empty<SearchResult>();
+            foreach (var result in results)
+                result.Score *= reg.ScoreMultiplier; // applied once, here, and nowhere else
+
             _log.Info($"  Provider '{reg.Provider.Name}': {results.Count} results in {sw.ElapsedMilliseconds}ms");
-
-            return new ProviderResult
-            {
-                Results = results,
-                ScoreMultiplier = reg.ScoreMultiplier,
-                ProviderName = reg.Provider.Name
-            };
+            return new ProviderResult(reg.Order, results);
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (TimeoutException)
         {
-            // Per-provider timeout (not the overall cancellation)
-            sw.Stop();
+            providerCts.Cancel(); // ask it to stop; we have already stopped waiting
             _log.Error($"  Provider '{reg.Provider.Name}': TIMEOUT after {sw.ElapsedMilliseconds}ms (limit: {reg.TimeoutMs}ms)");
-            return ProviderResult.Empty(reg.Provider.Name);
+            return ProviderResult.Empty(reg.Order);
         }
         catch (OperationCanceledException)
         {
-            // Overall cancellation — propagate
-            return ProviderResult.Empty(reg.Provider.Name);
+            return ProviderResult.Empty(reg.Order);
         }
         catch (Exception ex)
         {
-            sw.Stop();
             _log.Error($"  Provider '{reg.Provider.Name}': FAILED after {sw.ElapsedMilliseconds}ms", ex);
-            return ProviderResult.Empty(reg.Provider.Name);
+            return ProviderResult.Empty(reg.Order);
+        }
+        finally
+        {
+            // An abandoned provider may still be running: observe its fault and only dispose
+            // the linked CTS once it has really finished.
+            if (work is null)
+            {
+                providerCts.Dispose();
+            }
+            else
+            {
+                _ = work.ContinueWith(
+                    t => { _ = t.Exception; providerCts.Dispose(); },
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+            }
         }
     }
 
-    /// <summary>
-    /// Merges results from all providers, applies score multipliers,
-    /// deduplicates by Id, sorts by score, and limits to MaxResults.
-    /// </summary>
-    private List<SearchResult> MergeResults(ProviderResult[] providerResults)
+    /// <summary>Merges everything collected so far: dedupe by Id, sort, trim to MaxResults.</summary>
+    private List<SearchResult> MergeResults(List<ProviderResult> collected)
     {
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var merged = new List<SearchResult>();
+        var best = new Dictionary<string, (SearchResult Result, int Order)>(StringComparer.OrdinalIgnoreCase);
 
-        // Flatten all results and apply multipliers
-        foreach (var pr in providerResults)
+        foreach (var providerResult in collected)
         {
-            foreach (var result in pr.Results)
+            foreach (var result in providerResult.Results)
             {
-                // Apply score multiplier
-                result.Score *= pr.ScoreMultiplier;
-
-                // Deduplicate by Id (first occurrence wins — higher multiplier providers
-                // should be registered first for priority)
-                if (seen.Add(result.Id))
+                if (best.TryGetValue(result.Id, out var existing))
                 {
-                    merged.Add(result);
+                    bool better = result.Score > existing.Result.Score
+                        || (result.Score == existing.Result.Score && providerResult.Order < existing.Order);
+                    if (better) best[result.Id] = (result, providerResult.Order);
+                }
+                else
+                {
+                    best[result.Id] = (result, providerResult.Order);
                 }
             }
         }
 
-        // Sort by score descending, then alphabetically for tie-breaking
-        merged.Sort((a, b) =>
-        {
-            int scoreCompare = b.Score.CompareTo(a.Score);
-            return scoreCompare != 0
-                ? scoreCompare
-                : string.Compare(a.Title, b.Title, StringComparison.OrdinalIgnoreCase);
-        });
+        var merged = best.Values.Select(v => v.Result).ToList();
+        merged.Sort(CompareResults);
 
-        // Limit to MaxResults
         if (merged.Count > MaxResults)
             merged.RemoveRange(MaxResults, merged.Count - MaxResults);
 
         return merged;
     }
 
-    // ═══════════════════════════════════════════════
-    // Internal types
-    // ═══════════════════════════════════════════════
-
-    private sealed class ProviderRegistration
+    private static int CompareResults(SearchResult a, SearchResult b)
     {
-        public required ISearchProvider Provider { get; init; }
-        public double ScoreMultiplier { get; init; } = 1.0;
-        public int TimeoutMs { get; init; } = 3000;
+        int byScore = b.Score.CompareTo(a.Score);
+        if (byScore != 0) return byScore;
+
+        int byTitle = string.Compare(a.Title, b.Title, StringComparison.OrdinalIgnoreCase);
+        return byTitle != 0 ? byTitle : string.CompareOrdinal(a.Id, b.Id);
     }
 
-    private sealed class ProviderResult
+    private void Publish(Action<SearchSnapshot> onUpdate, SearchSnapshot snapshot)
     {
-        public IReadOnlyList<SearchResult> Results { get; init; } = Array.Empty<SearchResult>();
-        public double ScoreMultiplier { get; init; } = 1.0;
-        public string ProviderName { get; init; } = "";
-
-        public static ProviderResult Empty(string providerName) => new()
+        try
         {
-            ProviderName = providerName,
-            Results = Array.Empty<SearchResult>()
-        };
+            onUpdate(snapshot);
+        }
+        catch (Exception ex)
+        {
+            _log.Error("Search update callback failed", ex);
+        }
+    }
+
+    private sealed record ProviderRegistration(int Order, ISearchProvider Provider, double ScoreMultiplier, int TimeoutMs);
+
+    private sealed record ProviderResult(int Order, IReadOnlyList<SearchResult> Results)
+    {
+        public static ProviderResult Empty(int order) => new(order, Array.Empty<SearchResult>());
     }
 }

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
 using System.Windows.Media;
@@ -27,6 +28,10 @@ public sealed class ApplicationSearchProvider : ISearchProvider
     private List<AppEntry>? _appIndex;
     private bool _isIndexing;
 
+    // Icons are expensive (Win32 shell call + GDI) and the same apps match on most keystrokes.
+    // Frozen ImageSources are thread-safe, so a plain concurrent cache is enough.
+    private readonly ConcurrentDictionary<string, ImageSource?> _iconCache = new(StringComparer.OrdinalIgnoreCase);
+
     // Maximum results to return per query
     private const int MaxResults = 8;
 
@@ -51,31 +56,53 @@ public sealed class ApplicationSearchProvider : ISearchProvider
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        // Score all apps against the query
-        var results = new List<SearchResult>();
+        // Score every app (cheap, pure string work) ...
+        var scored = new List<(AppEntry App, double Score)>();
         foreach (var app in index)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
             double score = TextMatchScorer.Score(query, app.NameLower, app.NameTokens);
             if (score >= MinScore)
-            {
-                results.Add(CreateSearchResult(app, score));
-            }
+                scored.Add((app, score));
         }
 
-        // Sort by score descending, then by name for tie-breaking
-        results.Sort((a, b) =>
+        // ... rank, keep only the top N ...
+        scored.Sort((a, b) =>
         {
             int scoreCompare = b.Score.CompareTo(a.Score);
-            return scoreCompare != 0 ? scoreCompare : string.Compare(a.Title, b.Title, StringComparison.OrdinalIgnoreCase);
+            return scoreCompare != 0
+                ? scoreCompare
+                : string.Compare(a.App.Name, b.App.Name, StringComparison.OrdinalIgnoreCase);
         });
 
-        // Return top N results
-        if (results.Count > MaxResults)
-            results.RemoveRange(MaxResults, results.Count - MaxResults);
+        if (scored.Count > MaxResults)
+            scored.RemoveRange(MaxResults, scored.Count - MaxResults);
+
+        // ... and only then build SearchResults (which extracts icons). Previously icons were
+        // extracted for every app above MinScore, even those thrown away by the cut-off.
+        var results = new List<SearchResult>(scored.Count);
+        foreach (var (app, score) in scored)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            results.Add(CreateSearchResult(app, score));
+        }
 
         return Task.FromResult<IReadOnlyList<SearchResult>>(results);
+    }
+
+    /// <summary>
+    /// Builds the application index on a background thread so the first keystroke
+    /// after startup does not pay the ~2s Start Menu scan. Safe to call more than once.
+    /// </summary>
+    public void WarmUp()
+    {
+        _ = Task.Run(() =>
+        {
+            var sw = Stopwatch.StartNew();
+            EnsureIndexBuilt();
+            _log.Info($"Application index warm-up finished in {sw.ElapsedMilliseconds}ms");
+        });
     }
 
     /// <summary>
@@ -225,12 +252,15 @@ public sealed class ApplicationSearchProvider : ISearchProvider
         var iconPath = app.ShortcutPath ?? app.ExecutablePath;
         if (!string.IsNullOrEmpty(iconPath))
         {
-            icon = IconExtractor.ExtractIcon(iconPath);
+            icon = _iconCache.GetOrAdd(iconPath, static path => IconExtractor.ExtractIcon(path));
         }
 
         return new SearchResult
         {
-            Id = app.ExecutablePath,
+            // Shortcut path, not target exe: several Start Menu entries can share one target
+            // (e.g. mmc.exe), and the orchestrator deduplicates by Id. As a bonus the indexed
+            // "<App>.lnk" file result is now recognised as the same item and collapsed into it.
+            Id = app.ShortcutPath ?? app.ExecutablePath,
             Title = app.Name,
             Subtitle = "Application",
             ResultType = SearchResultType.Application,

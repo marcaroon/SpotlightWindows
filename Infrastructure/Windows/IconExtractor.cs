@@ -51,7 +51,9 @@ public static class IconExtractor
     {
         try
         {
-            if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
+            // Files AND folders: SHGetFileInfo returns the shell icon for both. The previous
+            // File.Exists-only guard silently gave every folder result a blank icon.
+            if (string.IsNullOrEmpty(filePath) || !(File.Exists(filePath) || Directory.Exists(filePath)))
                 return null;
 
             var shinfo = new SHFILEINFO();

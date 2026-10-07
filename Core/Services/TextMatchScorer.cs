@@ -10,6 +10,7 @@ namespace SpotlightWindows.Core.Services;
 ///   800   — prefix match (query is a prefix of the name)
 ///   600   — all query tokens match name tokens (word match)
 ///   500   — abbreviation match (query chars match first letters of tokens)
+///   400   — word-start match (query is the beginning of one word in the name)
 ///   300   — substring/contains match
 ///   100   — fuzzy match (characters appear in order)
 ///   0     — no match
@@ -21,6 +22,7 @@ public static class TextMatchScorer
     private const double ScorePrefixMatch = 800.0;
     private const double ScoreTokenMatch = 600.0;
     private const double ScoreAbbreviationMatch = 500.0;
+    private const double ScoreWordStartMatch = 400.0;
     private const double ScoreContainsMatch = 300.0;
     private const double ScoreFuzzyMatch = 100.0;
     private const double ScoreNoMatch = 0.0;
@@ -69,17 +71,21 @@ public static class TextMatchScorer
             return ScoreAbbreviationMatch + (Math.Min(lengthRatio, 1.0) * 50.0);
         }
 
-        // 5. Contains match — query is a substring of the name
+        // 5. Word-start match — query is the beginning of one of the words in the name,
+        //    e.g. "chrome" -> "Google Chrome". Previously this only scored as a plain substring
+        //    match (~346), which let any file merely *starting* with "chrome" outrank the app.
+        //    Stays below the abbreviation tier (max < 500) because ratio < 1 whenever the name has other words.
+        if (queryTokens.Length == 1 && AnyNameTokenStartsWith(queryLower, nameTokens))
+        {
+            double lengthRatio = (double)queryLower.Length / nameLower.Length;
+            return ScoreWordStartMatch + (Math.Min(lengthRatio, 0.99) * 100.0);
+        }
+
+        // 6. Contains match — query is a substring of the name
         if (nameLower.Contains(queryLower, StringComparison.Ordinal))
         {
             double lengthRatio = (double)queryLower.Length / nameLower.Length;
             return ScoreContainsMatch + (lengthRatio * 100.0);
-        }
-
-        // 6. Single query token matching a name token prefix
-        if (queryTokens.Length == 1 && AnyNameTokenStartsWith(queryLower, nameTokens))
-        {
-            return ScoreContainsMatch;
         }
 
         // 7. Fuzzy match — characters of query appear in order in the name

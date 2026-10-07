@@ -16,6 +16,14 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- The test project lives inside this folder; SDK globbing would otherwise compile it into the app -->
+    <Compile Remove="Tests\**" />
+    <EmbeddedResource Remove="Tests\**" />
+    <None Remove="Tests\**" />
+    <Page Remove="Tests\**" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Required for querying Windows Search Index via OLE DB -->
     <PackageReference Include="System.Data.OleDb" Version="9.0.*" />
   </ItemGroup>

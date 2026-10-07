@@ -21,7 +21,16 @@ public partial class MainWindow : Window
 
     // Search infrastructure
     private ISearchProvider? _searchProvider;
+    private IProgressiveSearchProvider? _progressiveProvider;
     private CancellationTokenSource? _searchCts;
+
+    // True while a search is in flight (drives the "Searching..." empty state)
+    private bool _isSearching;
+
+    // True once the user has moved the selection themselves during the current search.
+    // While false, the top result may change freely as better results arrive; once true,
+    // the selection is pinned to the same result (by Id) so Enter always launches what was highlighted.
+    private bool _userNavigated;
     private System.Windows.Threading.DispatcherTimer? _debounceTimer;
 
     // Debounce delay in milliseconds
@@ -58,6 +67,7 @@ public partial class MainWindow : Window
     public void SetSearchProvider(ISearchProvider provider)
     {
         _searchProvider = provider;
+        _progressiveProvider = provider as IProgressiveSearchProvider;
     }
 
     private void OnLoaded(object sender, RoutedEventArgs e)
@@ -90,6 +100,7 @@ public partial class MainWindow : Window
         CancelPendingSearch();
 
         // Clear state
+        _userNavigated = false;
         SearchTextBox.Clear();
         _results.Clear();
         UpdateVisualState();
@@ -202,27 +213,30 @@ public partial class MainWindow : Window
         var cts = new CancellationTokenSource();
         _searchCts = cts;
 
+        // Capture the token NOW. CancelPendingSearch() disposes the CTS when a newer search starts,
+        // and reading cts.Token on a disposed CTS throws ObjectDisposedException.
+        var token = cts.Token;
+
+        _userNavigated = false;
+        _isSearching = true;
+        UpdateVisualState();
+
         try
         {
-            var results = await _searchProvider.SearchAsync(query.Trim(), cts.Token);
+            var trimmed = query.Trim();
 
-            // Only update UI if this is still the current search
-            if (cts.Token.IsCancellationRequested)
-                return;
-
-            _results.Clear();
-            foreach (var result in results)
+            if (_progressiveProvider is not null)
             {
-                _results.Add(result);
+                // Results are applied as each provider finishes (apps first, files when ready)
+                await _progressiveProvider.SearchProgressiveAsync(
+                    trimmed, snapshot => OnSearchSnapshot(token, snapshot), token);
             }
-
-            // Auto-select the first result
-            if (_results.Count > 0)
+            else
             {
-                ResultsListBox.SelectedIndex = 0;
+                var results = await _searchProvider.SearchAsync(trimmed, token);
+                if (!token.IsCancellationRequested)
+                    ApplyResults(results);
             }
-
-            UpdateVisualState();
         }
         catch (OperationCanceledException)
         {
@@ -231,14 +245,98 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             _log.Error("Search failed", ex);
-            _results.Clear();
-            UpdateVisualState();
+
+            // Only touch the UI if this search is still the current one; a stale search must
+            // never wipe out the results of the search that replaced it.
+            if (!token.IsCancellationRequested)
+            {
+                _results.Clear();
+            }
         }
+        finally
+        {
+            if (ReferenceEquals(_searchCts, cts))
+            {
+                _isSearching = false;
+                UpdateVisualState();
+            }
+        }
+    }
+
+    private void OnSearchSnapshot(CancellationToken token, SearchSnapshot snapshot)
+    {
+        if (token.IsCancellationRequested) return;
+
+        // The orchestrator publishes on the caller's context (UI thread), but don't rely on it
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.InvokeAsync(() => OnSearchSnapshot(token, snapshot));
+            return;
+        }
+
+        ApplyResults(snapshot.Results);
+    }
+
+    /// <summary>
+    /// Replaces the displayed results. Keeps the highlighted result if the user moved the
+    /// selection themselves; otherwise selects the (possibly new) top result.
+    /// </summary>
+    private void ApplyResults(IReadOnlyList<SearchResult> newResults)
+    {
+        // Nothing changed since the last snapshot -> leave list and selection alone (no flicker)
+        if (newResults.Count == _results.Count)
+        {
+            bool same = true;
+            for (int i = 0; i < newResults.Count; i++)
+            {
+                if (!string.Equals(newResults[i].Id, _results[i].Id, StringComparison.OrdinalIgnoreCase))
+                {
+                    same = false;
+                    break;
+                }
+            }
+
+            if (same)
+            {
+                UpdateVisualState();
+                return;
+            }
+        }
+
+        string? pinnedId = _userNavigated ? (ResultsListBox.SelectedItem as SearchResult)?.Id : null;
+
+        _results.Clear();
+        foreach (var result in newResults)
+        {
+            _results.Add(result);
+        }
+
+        if (_results.Count > 0)
+        {
+            int index = 0;
+
+            if (pinnedId is not null)
+            {
+                for (int i = 0; i < _results.Count; i++)
+                {
+                    if (string.Equals(_results[i].Id, pinnedId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        index = i;
+                        break;
+                    }
+                }
+            }
+
+            ResultsListBox.SelectedIndex = index;
+        }
+
+        UpdateVisualState();
     }
 
     private void CancelPendingSearch()
     {
         _debounceTimer?.Stop();
+        _isSearching = false;
 
         if (_searchCts is not null)
         {
@@ -262,6 +360,7 @@ public partial class MainWindow : Window
         if (next < 0) next = _results.Count - 1; // Wrap to bottom
         if (next >= _results.Count) next = 0;     // Wrap to top
 
+        _userNavigated = true;
         ResultsListBox.SelectedIndex = next;
         ResultsListBox.ScrollIntoView(ResultsListBox.SelectedItem);
     }
@@ -332,13 +431,34 @@ public partial class MainWindow : Window
         bool hasResults = _results.Count > 0;
         bool hasQuery = !string.IsNullOrEmpty(SearchTextBox?.Text);
 
+        ResultsPanelBorder.Visibility = hasQuery ? Visibility.Visible : Visibility.Collapsed;
         ResultsListBox.Visibility = hasResults ? Visibility.Visible : Visibility.Collapsed;
         EmptyStatePanel.Visibility = hasResults ? Visibility.Collapsed : Visibility.Visible;
+
+        if (hasQuery && hasResults)
+        {
+            int itemCount = Math.Min(_results.Count, 8);
+            double itemHeight = 52; // approximate result row height
+            double listHeight = itemCount * itemHeight + 12;
+            ResultsListBox.MaxHeight = Math.Min(listHeight, 360);
+            ResultsListBox.Height = Math.Min(listHeight, 360);
+        }
+        else
+        {
+            ResultsListBox.Height = double.NaN;
+            ResultsListBox.MaxHeight = 360;
+        }
 
         if (!hasQuery)
         {
             EmptyStateIcon.Text = "\uE773"; // Search icon
             EmptyStateText.Text = "Start typing to search...";
+        }
+        else if (!hasResults && _isSearching)
+        {
+            // Don't flash "No results" while providers are still working
+            EmptyStateIcon.Text = "\uE773"; // Search icon
+            EmptyStateText.Text = "Searching...";
         }
         else if (!hasResults)
         {

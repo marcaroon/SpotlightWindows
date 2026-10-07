@@ -20,3 +20,7 @@ Desktop.ini
 
 # Logs (local diagnostics)
 *.log
+
+# Project notes / generated reports
+phase*_report.md
+Claude Code Prompt - Windows Spotlight Launcher.md

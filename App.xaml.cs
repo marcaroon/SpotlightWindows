@@ -32,11 +32,19 @@ public partial class App : Application
         _launcherWindow = new MainWindow();
         _launcherWindow.ExitRequested += OnExitRequested;
 
-        // Initialize and inject search providers (Phase 2 + Phase 3)
+        // Search providers (Phase 2 + 3) wired through the orchestrator (Phase 4).
+        // Registration order matters only as a tie-breaker when two providers return the same Id.
+        // Weights are hand-tuned starting points — Phase 6 usage history should replace them.
         var appSearchProvider = new ApplicationSearchProvider();
         var fileSearchProvider = new FileSearchProvider();
-        var compositeProvider = new CompositeSearchProvider(appSearchProvider, fileSearchProvider);
-        _launcherWindow.SetSearchProvider(compositeProvider);
+
+        var orchestrator = new SearchOrchestrator { MaxResults = 10 };
+        orchestrator.RegisterProvider(appSearchProvider, scoreMultiplier: 1.0, timeoutMs: 3000);
+        orchestrator.RegisterProvider(fileSearchProvider, scoreMultiplier: 0.5, timeoutMs: 3000);
+        _launcherWindow.SetSearchProvider(orchestrator);
+
+        // Build the application index in the background so the first search is instant
+        appSearchProvider.WarmUp();
 
         // Register the global hotkey
         _hotkeyService = new HotkeyService();
